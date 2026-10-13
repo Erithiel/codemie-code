@@ -915,6 +915,21 @@ describe('enrichCosts — sessions resumed onto one shared log', () => {
     expect(index.get('new')!.tokens.input).toBe(1_000_000);
   });
 
+  it('gives tied start times disjoint windows (sessionId tie-break)', async () => {
+    const a = { ...oldRaw, sessionId: 'a', startEvent: { agentName: 'claude', data: { startTime: T0 } } };
+    const b = { ...oldRaw, sessionId: 'b', startEvent: { agentName: 'claude', data: { startTime: T0 } } };
+    const { index } = await enrichCosts([b, a, newRaw] as never[], deps);
+    expect(index.get('a')?.tokens.input ?? 0).toBe(0);
+    expect(index.get('b')!.tokens.input).toBe(2_000_000);
+    expect(index.get('new')!.tokens.input).toBe(1_000_000);
+  });
+
+  it('solo session on a log keeps records earlier than its start time', async () => {
+    const solo = { sessionId: 'solo', startEvent: { agentName: 'claude', data: { startTime: T1 + 5000 } }, deltas: [] };
+    const { index } = await enrichCosts([solo] as never[], deps);
+    expect(index.get('solo')!.tokens.input).toBe(3_000_000);
+  });
+
   it('resolves agent and start time from top-level fields when startEvent is absent', async () => {
     const a = { sessionId: 'a', agentName: 'claude', startTime: T0, deltas: [] };
     const b = { sessionId: 'b', agentName: 'claude', startTime: T1, deltas: [] };

@@ -135,11 +135,10 @@ async function buildWindows(
   }
   const windows = new Map<string, UsageWindow>();
   for (const list of byFile.values()) {
-    list.sort((a, b) => a.startTime - b.startTime);
+    if (list.length < 2) continue; // solo session: no window, keep every record
+    list.sort((a, b) => a.startTime - b.startTime || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
     list.forEach((s, i) => {
-      if (s.own) {
-        windows.set(s.sessionId, { from: s.startTime, to: list.find((n) => n.startTime > s.startTime)?.startTime ?? Infinity, keepUntimed: i === 0 });
-      }
+      if (s.own) windows.set(s.sessionId, { from: s.startTime, to: list[i + 1]?.startTime ?? Infinity, keepUntimed: i === 0 });
     });
   }
   return windows;
