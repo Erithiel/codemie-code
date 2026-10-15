@@ -3,7 +3,8 @@
  * bare `codemie hook` no longer fails with `command not found` when the hook
  * shell's PATH lacks the codemie bin dir. See EPMCDME-14035.
  */
-import { realpathSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
+import { dirname, join } from 'path';
 import { getCommandPath } from './processes.js';
 
 // Shell-special chars that force the command path to be quoted; mirrors BaseAgentAdapter.
@@ -57,6 +58,34 @@ function toForwardSlash(p: string): string {
 // node_modules/.bin precedes the global bin dir) is rejected: hooks would run the
 // agent, not this CLI.
 export async function resolveCodemieBinary(): Promise<string> {
+  return withPowerShellCall(await resolveBinary());
+}
+
+// Claude Code runs hooks in Git Bash when it finds one, else in PowerShell, which
+// parses a leading quoted string as an expression ("Unexpected token 'hook'") and
+// needs the call operator. `&` is a syntax error in bash, so only add it without bash.
+async function withPowerShellCall(binary: string): Promise<string> {
+  if (process.platform !== 'win32' || !binary.startsWith('"')) return binary;
+  try {
+    if (await hasGitBash()) return binary;
+  } catch {
+    // fall through — treat as no bash
+  }
+  return `& ${binary}`;
+}
+
+// Mirrors Claude Code's lookup: CLAUDE_CODE_GIT_BASH_PATH, else bash.exe next to the
+// PATH git (<git>/cmd/git.exe -> <git>/bin/bash.exe).
+async function hasGitBash(): Promise<boolean> {
+  const override = process.env.CLAUDE_CODE_GIT_BASH_PATH;
+  if (override) return existsSync(override);
+  const git = await getCommandPath('git');
+  if (!git) return false;
+  const dir = dirname(git);
+  return existsSync(join(dir, 'bash.exe')) || existsSync(join(dirname(dir), 'bin', 'bash.exe'));
+}
+
+async function resolveBinary(): Promise<string> {
   try {
     const resolved = await getCommandPath('codemie');
     if (resolved && !isShadowedCodemieShim(resolved)) return quoteIfNeeded(toForwardSlash(resolved));
@@ -85,13 +114,20 @@ export function resolveHookCommand(command: string, binary: string): string {
   if (command === 'codemie') return binary;
   if (command.startsWith('codemie ')) return binary + command.slice('codemie'.length);
 
-  const firstTokenEnd = command.startsWith('"')
-    ? command.indexOf('"', 1) + 1
-    : command.indexOf(' ');
+  const body = command.replace(/^& /, '');
+  const firstTokenEnd = body.startsWith('"') ? body.indexOf('"', 1) + 1 : body.indexOf(' ');
   if (firstTokenEnd > 0) {
-    const firstToken = command.slice(0, firstTokenEnd);
-    if (isShadowedCodemieShim(firstToken)) {
-      return binary + command.slice(firstTokenEnd);
+    const firstToken = body.slice(0, firstTokenEnd);
+    const path = firstToken.replace(/^"|"$/g, '');
+    const isCodemiePath = /^([a-zA-Z]:)?[\\/]/.test(path) && /[\\/]codemie(\.cmd)?$/i.test(path);
+    // Shadowed shim, or a codemie path whose file is gone (e.g. an old npm-prefix install):
+    // re-resolve instead of keeping a command that can only fail. EPMCDME-15907.
+    if (isShadowedCodemieShim(firstToken) || (isCodemiePath && !existsSync(path))) {
+      return binary + body.slice(firstTokenEnd);
+    }
+    // Same file, but the hook shell changed (Git Bash installed/removed): fix the `& ` prefix.
+    if (isCodemiePath && firstToken.startsWith('"')) {
+      return (binary.startsWith('& ') ? '& ' : '') + body;
     }
   }
   return command;

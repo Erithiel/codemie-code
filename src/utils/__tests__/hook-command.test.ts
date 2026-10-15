@@ -2,12 +2,14 @@
  * Unit tests for the shared codemie hook-command resolver.
  * @group unit
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 describe('hook-command resolver', () => {
   beforeEach(() => {
     vi.resetModules();
+    vi.stubEnv('CLAUDE_CODE_GIT_BASH_PATH', process.execPath); // Git Bash present by default
   });
+  afterEach(() => vi.unstubAllEnvs());
 
   it('resolveHookCommand replaces the leading codemie token, preserving args', async () => {
     const { resolveHookCommand } = await import('../hook-command.js');
@@ -18,12 +20,39 @@ describe('hook-command resolver', () => {
     expect(resolveHookCommand('codemie', '/usr/local/bin/codemie')).toBe('/usr/local/bin/codemie');
   });
 
-  it('resolveHookCommand leaves non-codemie and already-absolute commands unchanged', async () => {
+  it('resolveHookCommand leaves non-codemie commands unchanged', async () => {
     const { resolveHookCommand } = await import('../hook-command.js');
     expect(resolveHookCommand('echo hi', '/usr/local/bin/codemie')).toBe('echo hi');
-    expect(resolveHookCommand('/usr/local/bin/codemie hook', '/usr/local/bin/codemie')).toBe(
-      '/usr/local/bin/codemie hook',
-    );
+    expect(resolveHookCommand('/usr/bin/env hook', '/usr/local/bin/codemie')).toBe('/usr/bin/env hook');
+  });
+
+  it('resolveHookCommand re-resolves an absolute codemie path whose file no longer exists (EPMCDME-15907)', async () => {
+    const { resolveHookCommand } = await import('../hook-command.js');
+    expect(
+      resolveHookCommand('C:/Users/u/AppData/Local/CodeMie/npm-prefix/codemie hook', 'C:/x/bin/codemie.cmd'),
+    ).toBe('C:/x/bin/codemie.cmd hook');
+  });
+
+  it('resolveHookCommand adds/removes the PowerShell `& ` prefix on a quoted existing path', async () => {
+    const p = 'C:/Users/u/CodeMie Connect/bin/codemie.cmd';
+    vi.doMock('fs', async (orig) => ({ ...(await orig<typeof import('fs')>()), existsSync: () => true }));
+    const { resolveHookCommand } = await import('../hook-command.js');
+    expect(resolveHookCommand(`"${p}" hook`, `& "${p}"`)).toBe(`& "${p}" hook`);
+    expect(resolveHookCommand(`& "${p}" hook`, `"${p}"`)).toBe(`"${p}" hook`);
+    vi.doUnmock('fs');
+  });
+
+  it('resolveCodemieBinary: on Windows without Git Bash, a quoted path gets the PowerShell call operator', async () => {
+    vi.doMock('../processes.js', () => ({
+      getCommandPath: vi.fn(async (c: string) =>
+        c === 'git' ? null : 'C:\\Users\\u\\AppData\\Local\\CodeMie Connect\\bin\\codemie.cmd',
+      ),
+    }));
+    vi.stubEnv('CLAUDE_CODE_GIT_BASH_PATH', '');
+    const platSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const { resolveCodemieBinary } = await import('../hook-command.js');
+    expect(await resolveCodemieBinary()).toBe('& "C:/Users/u/AppData/Local/CodeMie Connect/bin/codemie.cmd"');
+    platSpy.mockRestore();
   });
 
   it('resolveCodemieBinary prefers getCommandPath and quotes spaces', async () => {
@@ -52,7 +81,9 @@ describe('hook-command resolver', () => {
   });
 
   it('resolveCodemieBinary: on Windows, a .js argv[1] fallback is prefixed with node and uses forward slashes', async () => {
-    vi.doMock('../processes.js', () => ({ getCommandPath: vi.fn().mockResolvedValue(null) }));
+    vi.doMock('../processes.js', () => ({
+      getCommandPath: vi.fn(async (c: string) => (c === 'git' ? 'C:/Git/cmd/git.exe' : null)),
+    }));
     const argvSpy = vi.spyOn(process, 'argv', 'get').mockReturnValue(['node', 'C:\\Users\\u\\app\\codemie.js']);
     const platSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     const execSpy = vi.spyOn(process, 'execPath', 'get').mockReturnValue('C:\\Program Files\\nodejs\\node.exe');
