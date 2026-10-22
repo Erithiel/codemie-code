@@ -4,7 +4,7 @@
  * shell's PATH lacks the codemie bin dir. See EPMCDME-14035.
  */
 import { existsSync, realpathSync } from 'fs';
-import { dirname, join } from 'path';
+import { extname } from 'path';
 import { getCommandPath } from './processes.js';
 
 // Shell-special chars that force the command path to be quoted; mirrors BaseAgentAdapter.
@@ -58,36 +58,16 @@ function toForwardSlash(p: string): string {
 // node_modules/.bin precedes the global bin dir) is rejected: hooks would run the
 // agent, not this CLI.
 export async function resolveCodemieBinary(): Promise<string> {
-  return withPowerShellCall(await resolveBinary());
-}
-
-// Claude Code runs hooks in Git Bash when it finds one, else in PowerShell, which
-// parses a leading quoted string as an expression ("Unexpected token 'hook'") and
-// needs the call operator. `&` is a syntax error in bash, so only add it without bash.
-async function withPowerShellCall(binary: string): Promise<string> {
-  if (process.platform !== 'win32' || !binary.startsWith('"')) return binary;
-  try {
-    if (await hasGitBash()) return binary;
-  } catch {
-    // fall through — treat as no bash
-  }
-  return `& ${binary}`;
-}
-
-// Mirrors Claude Code's lookup: CLAUDE_CODE_GIT_BASH_PATH, else bash.exe next to the
-// PATH git (<git>/cmd/git.exe -> <git>/bin/bash.exe).
-async function hasGitBash(): Promise<boolean> {
-  const override = process.env.CLAUDE_CODE_GIT_BASH_PATH;
-  if (override) return existsSync(override);
-  const git = await getCommandPath('git');
-  if (!git) return false;
-  const dir = dirname(git);
-  return existsSync(join(dir, 'bash.exe')) || existsSync(join(dirname(dir), 'bin', 'bash.exe'));
+  return resolveBinary();
 }
 
 async function resolveBinary(): Promise<string> {
   try {
-    const resolved = await getCommandPath('codemie');
+    let resolved = await getCommandPath('codemie');
+    // npm's extensionless sh shim comes first in `where` output; PowerShell can only run the .cmd.
+    if (resolved && process.platform === 'win32' && !extname(resolved) && existsSync(`${resolved}.cmd`)) {
+      resolved = `${resolved}.cmd`;
+    }
     if (resolved && !isShadowedCodemieShim(resolved)) return quoteIfNeeded(toForwardSlash(resolved));
   } catch {
     // fall through
@@ -109,37 +89,39 @@ async function resolveBinary(): Promise<string> {
 
 // Rewrite a leading `codemie` token to `binary`; other commands pass through.
 // Also rewrites absolute paths baked in by older resolvers that point at the
-// bundled agent shim, so already-installed hooks get repaired on rewrite.
-export function resolveHookCommand(command: string, binary: string): string {
-  if (command === 'codemie') return binary;
-  if (command.startsWith('codemie ')) return binary + command.slice('codemie'.length);
+// bundled agent shim or a file that is gone, so already-installed hooks get repaired.
+// `powershell` adds the call operator `& ` to quoted paths: hooks marked `"shell": "powershell"`
+// (see rewriteHooksCommandTree) parse a leading quoted string as a plain string and never run it.
+// Parses what resolveBinary emits: `path`, `"path"`, or `"node" "script.js"`.
+export function resolveHookCommand(command: string, binary: string, powershell = false): string {
+  const render = (c: string): string => (powershell && c.startsWith('"') ? `& ${c}` : c);
+  if (command === 'codemie') return render(binary);
+  if (command.startsWith('codemie ')) return render(binary) + command.slice('codemie'.length);
 
-  const body = command.replace(/^& /, '');
-  const firstTokenEnd = body.startsWith('"') ? body.indexOf('"', 1) + 1 : body.indexOf(' ');
-  if (firstTokenEnd > 0) {
-    const firstToken = body.slice(0, firstTokenEnd);
-    const path = firstToken.replace(/^"|"$/g, '');
-    const isCodemiePath = /^([a-zA-Z]:)?[\\/]/.test(path) && /[\\/]codemie(\.cmd)?$/i.test(path);
-    // Shadowed shim, or a codemie path whose file is gone (e.g. an old npm-prefix install):
-    // re-resolve instead of keeping a command that can only fail. EPMCDME-15907.
-    if (isShadowedCodemieShim(firstToken) || (isCodemiePath && !existsSync(path))) {
-      return binary + body.slice(firstTokenEnd);
-    }
-    // Same file, but the hook shell changed (Git Bash installed/removed): fix the `& ` prefix.
-    if (isCodemiePath && firstToken.startsWith('"')) {
-      return (binary.startsWith('& ') ? '& ' : '') + body;
-    }
+  const match = /^(?:& )?("[^"]*"(?: "[^"]*\.[cm]?js")?|\S+)([\s\S]*)$/.exec(command);
+  if (!match) return command;
+  const [, head, rest] = match;
+  const paths = (head.match(/"[^"]*"|\S+/g) ?? []).map((t) => t.replace(/^"|"$/g, ''));
+  const last = paths[paths.length - 1];
+  const isCodemiePath = /^([a-zA-Z]:)?[\\/]/.test(last) && /[\\/]codemie(\.(cmd|ps1|exe|[cm]?js))?$/i.test(last);
+  // Shadowed shim, or a codemie path whose file is gone (e.g. an old npm-prefix install):
+  // re-resolve instead of keeping a command that can only fail. EPMCDME-15907.
+  if (paths.some(isShadowedCodemieShim) || (isCodemiePath && !paths.every((p) => existsSync(p)))) {
+    return render(binary) + rest;
   }
-  return command;
+  // Same file, but the hook shell changed (Git Bash installed/removed): fix the `& ` prefix.
+  return isCodemiePath ? render(head) + rest : command;
 }
 
 // Recursively rewrite every string `command` field anywhere in a hooks structure.
 // Shape-agnostic (no hardcoded layout). Mutates in place; returns true if anything changed.
-export function rewriteHooksCommandTree(node: unknown, binary: string): boolean {
+// With `powershell`, a hook whose command needs `& ` is pinned to `"shell": "powershell"`, so
+// Claude Code no longer picks bash/PowerShell by guessing and the `&` is never seen by bash.
+export function rewriteHooksCommandTree(node: unknown, binary: string, powershell = false): boolean {
   if (Array.isArray(node)) {
     let changed = false;
     for (const item of node) {
-      if (rewriteHooksCommandTree(item, binary)) changed = true;
+      if (rewriteHooksCommandTree(item, binary, powershell)) changed = true;
     }
     return changed;
   }
@@ -149,12 +131,16 @@ export function rewriteHooksCommandTree(node: unknown, binary: string): boolean 
     let changed = false;
     for (const [key, value] of Object.entries(record)) {
       if (key === 'command' && typeof value === 'string') {
-        const next = resolveHookCommand(value, binary);
+        const next = resolveHookCommand(value, binary, powershell);
         if (next !== value) {
           record[key] = next;
           changed = true;
         }
-      } else if (rewriteHooksCommandTree(value, binary)) {
+        if (powershell && next.startsWith('& ') && record.shell !== 'powershell') {
+          record.shell = 'powershell';
+          changed = true;
+        }
+      } else if (rewriteHooksCommandTree(value, binary, powershell)) {
         changed = true;
       }
     }

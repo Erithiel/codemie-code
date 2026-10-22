@@ -7,7 +7,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 describe('hook-command resolver', () => {
   beforeEach(() => {
     vi.resetModules();
-    vi.stubEnv('CLAUDE_CODE_GIT_BASH_PATH', process.execPath); // Git Bash present by default
   });
   afterEach(() => vi.unstubAllEnvs());
 
@@ -37,22 +36,36 @@ describe('hook-command resolver', () => {
     const p = 'C:/Users/u/CodeMie Connect/bin/codemie.cmd';
     vi.doMock('fs', async (orig) => ({ ...(await orig<typeof import('fs')>()), existsSync: () => true }));
     const { resolveHookCommand } = await import('../hook-command.js');
-    expect(resolveHookCommand(`"${p}" hook`, `& "${p}"`)).toBe(`& "${p}" hook`);
-    expect(resolveHookCommand(`& "${p}" hook`, `"${p}"`)).toBe(`"${p}" hook`);
+    expect(resolveHookCommand(`"${p}" hook`, `"${p}"`, true)).toBe(`& "${p}" hook`);
+    expect(resolveHookCommand(`& "${p}" hook`, `"${p}"`, false)).toBe(`"${p}" hook`);
     vi.doUnmock('fs');
   });
 
-  it('resolveCodemieBinary: on Windows without Git Bash, a quoted path gets the PowerShell call operator', async () => {
-    vi.doMock('../processes.js', () => ({
-      getCommandPath: vi.fn(async (c: string) =>
-        c === 'git' ? null : 'C:\\Users\\u\\AppData\\Local\\CodeMie Connect\\bin\\codemie.cmd',
-      ),
-    }));
-    vi.stubEnv('CLAUDE_CODE_GIT_BASH_PATH', '');
-    const platSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
-    const { resolveCodemieBinary } = await import('../hook-command.js');
-    expect(await resolveCodemieBinary()).toBe('& "C:/Users/u/AppData/Local/CodeMie Connect/bin/codemie.cmd"');
-    platSpy.mockRestore();
+  it('resolveHookCommand round-trips the `"node" "script.js"` form emitted by resolveBinary', async () => {
+    const bin = '"C:/Program Files/nodejs/node.exe" "C:/app/bin/codemie.js"';
+    vi.doMock('fs', async (orig) => ({ ...(await orig<typeof import('fs')>()), existsSync: () => true }));
+    const { resolveHookCommand } = await import('../hook-command.js');
+    expect(resolveHookCommand(`${bin} hook`, bin, true)).toBe(`& ${bin} hook`);
+    expect(resolveHookCommand(`& ${bin} hook`, bin, false)).toBe(`${bin} hook`);
+    vi.doUnmock('fs');
+  });
+
+  it('resolveHookCommand heals a stale .exe / .ps1 codemie path', async () => {
+    const { resolveHookCommand } = await import('../hook-command.js');
+    expect(resolveHookCommand('"C:/gone/codemie.exe" hook', 'C:/x/codemie.cmd')).toBe('C:/x/codemie.cmd hook');
+    expect(resolveHookCommand('& "C:/gone/codemie.ps1" hook', 'C:/x/codemie.cmd')).toBe('C:/x/codemie.cmd hook');
+  });
+
+  it('rewriteHooksCommandTree pins quoted-path hooks to "shell": "powershell" only in powershell mode', async () => {
+    const { rewriteHooksCommandTree } = await import('../hook-command.js');
+    const bin = '"C:/Program Files/CodeMie/bin/codemie.cmd"';
+    const make = () => ({ SessionStart: [{ hooks: [{ type: 'command', command: 'codemie hook' }] }] });
+    const ps = make();
+    expect(rewriteHooksCommandTree(ps, bin, true)).toBe(true);
+    expect(ps.SessionStart[0].hooks[0]).toMatchObject({ command: `& ${bin} hook`, shell: 'powershell' });
+    const sh = make();
+    rewriteHooksCommandTree(sh, bin, false);
+    expect(sh.SessionStart[0].hooks[0]).toEqual({ type: 'command', command: `${bin} hook` });
   });
 
   it('resolveCodemieBinary prefers getCommandPath and quotes spaces', async () => {
