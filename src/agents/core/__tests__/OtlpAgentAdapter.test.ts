@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 
 const detectGitBranchMock = vi.fn();
 const detectGitRemoteRepoMock = vi.fn();
@@ -11,7 +12,10 @@ const resolveHookCredentialsMock = vi.fn();
 const resolveIdentityMock = vi.fn();
 const getActiveProfileNameMock = vi.fn();
 const configLoadMock = vi.fn();
+const hasLocalConfigMock = vi.fn();
 const getCurrentCliVersionMock = vi.fn();
+const readPinnedProjectNameMock = vi.fn();
+const pinProjectNameMock = vi.fn();
 
 vi.mock('../hook-credentials.js', () => ({ resolveHookCredentials: resolveHookCredentialsMock }));
 vi.mock('../identity-resolver.js', async () => ({
@@ -19,9 +23,13 @@ vi.mock('../identity-resolver.js', async () => ({
   resolveIdentity: resolveIdentityMock,
 }));
 vi.mock('@/utils/config.js', () => ({
-  ConfigLoader: { getActiveProfileName: getActiveProfileNameMock, load: configLoadMock },
+  ConfigLoader: { getActiveProfileName: getActiveProfileNameMock, load: configLoadMock, hasLocalConfig: hasLocalConfigMock },
 }));
 vi.mock('@/utils/cli-updater.js', () => ({ getCurrentCliVersion: getCurrentCliVersionMock }));
+vi.mock('../session-project-pin.js', () => ({
+  readPinnedProjectName: readPinnedProjectNameMock,
+  pinProjectName: pinProjectNameMock,
+}));
 vi.mock('@/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
@@ -33,6 +41,7 @@ type Context = import('../OtlpAgentAdapter.js').OtlpHookContext;
 interface FakeInput {
   cwd: string;
   prompt?: string;
+  sessionId?: string;
   payload: Record<string, unknown>[];
   block?: boolean;
 }
@@ -46,7 +55,7 @@ class FakeAdapter extends OtlpAgentAdapter<FakeInput> {
     return typeof parsed.cwd === 'string' ? (parsed as FakeInput) : null;
   }
   protected extractHookContext(input: FakeInput): Context {
-    return { cwd: input.cwd, prompt: input.prompt };
+    return { cwd: input.cwd, prompt: input.prompt, sessionId: input.sessionId };
   }
   protected async isTracked(): Promise<boolean> {
     return this.tracked;
@@ -62,6 +71,15 @@ class FakeAdapter extends OtlpAgentAdapter<FakeInput> {
   }
   protected resolveEventType(event: Record<string, unknown>): string {
     return event['kind'] === 'start' ? 'fake.start' : 'fake.event';
+  }
+  /** Test-only deterministic id: `<type>:<session>:<sha256(payload + timestamp)>`. */
+  protected buildEventId(
+    event: Record<string, unknown>,
+    payload: Record<string, unknown>,
+    timestamp: string
+  ): string {
+    const hash = createHash('sha256').update(`${JSON.stringify(payload)}::${timestamp}`).digest('hex');
+    return `${String(event['type'])}:${String(event['session_id'])}:${hash}`;
   }
 }
 
@@ -96,11 +114,17 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
     getActiveProfileNameMock.mockResolvedValue('work');
     configLoadMock.mockResolvedValue({ codeMieProject: 'proj-1' });
     getCurrentCliVersionMock.mockResolvedValue('1.2.3');
+    readPinnedProjectNameMock.mockResolvedValue(undefined);
+    pinProjectNameMock.mockImplementation(async (_sessionId: string, project: string) => project);
     delete process.env['SDLC_ANALYTICS_STORY_ID'];
+    delete process.env['CODEMIE_PROJECT'];
+    delete process.env['CLAUDE_PROJECT_DIR'];
   });
 
   afterEach(() => {
     delete process.env['SDLC_ANALYTICS_STORY_ID'];
+    delete process.env['CODEMIE_PROJECT'];
+    delete process.env['CLAUDE_PROJECT_DIR'];
     vi.restoreAllMocks();
   });
 
@@ -179,6 +203,25 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
     expect(forwarded()[0]).toMatchObject({ story_id: 'BR-2', story_source: 'branch' });
   });
 
+  it("re-derives the branch story for an event's own git_branch when it differs from the hook-time branch", async () => {
+    detectGitBranchMock.mockResolvedValue('feature/BR-2'); // hook-time branch: ticketed
+    await run({ payload: [{ git_branch: 'master' }] }); // event's own branch: untracked
+    expect(forwarded()[0]).toMatchObject({ git_branch: 'master', story_id: '', story_source: '' });
+  });
+
+  it("re-derives a branch story for an event's own git_branch even when the hook-time branch has none", async () => {
+    detectGitBranchMock.mockResolvedValue('master'); // hook-time branch: untracked
+    await run({ payload: [{ git_branch: 'feature/BR-2' }] }); // event's own branch: ticketed
+    expect(forwarded()[0]).toMatchObject({ git_branch: 'feature/BR-2', story_id: 'BR-2', story_source: 'branch' });
+  });
+
+  it('never overrides an explicit or marker story even when the event carries a different, ticketed git_branch', async () => {
+    process.env['SDLC_ANALYTICS_STORY_ID'] = 'ABC-1';
+    detectGitBranchMock.mockResolvedValue('master');
+    await run({ payload: [{ git_branch: 'feature/BR-2' }] });
+    expect(forwarded()[0]).toMatchObject({ git_branch: 'feature/BR-2', story_id: 'ABC-1', story_source: 'explicit' });
+  });
+
   it("stamps '' on a detached HEAD, even when the record carries an empty value", async () => {
     detectGitBranchMock.mockResolvedValue(undefined);
     await run({ payload: [{ git_branch: '' }] });
@@ -222,7 +265,81 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
       expect(configLoadMock).toHaveBeenCalledWith('/repo', undefined);
     });
 
-    it('still forwards with empty context fields when resolution fails', async () => {
+    it('prefers CODEMIE_PROJECT over the resolved config, without even loading it', async () => {
+      process.env['CODEMIE_PROJECT'] = 'env-project';
+      await run();
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'env-project' });
+      expect(configLoadMock).not.toHaveBeenCalled();
+    });
+
+    it('ignores a blank CODEMIE_PROJECT and falls back to the resolved config', async () => {
+      process.env['CODEMIE_PROJECT'] = '   ';
+      await run();
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'proj-1' });
+    });
+
+    it('ignores a blank CLAUDE_PROJECT_DIR and resolves from the hook cwd instead', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '   ';
+      await run();
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/repo');
+      expect(hasLocalConfigMock).not.toHaveBeenCalled();
+    });
+
+    it('resolves the config from CLAUDE_PROJECT_DIR, not the hook cwd, when it is set', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '/workspace/project';
+      hasLocalConfigMock.mockResolvedValue(true);
+      await run({ cwd: '/workspace/project/src' });
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/workspace/project');
+      expect(configLoadMock).toHaveBeenCalledWith('/workspace/project', { name: 'work' });
+    });
+
+    it('walks up from CLAUDE_PROJECT_DIR to the nearest ancestor with a local .codemie config', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '/workspace/mono/apps/web';
+      hasLocalConfigMock.mockImplementation(async (dir: string) => dir === '/workspace/mono');
+      await run();
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/workspace/mono');
+    });
+
+    it('falls back to CLAUDE_PROJECT_DIR itself when no ancestor has a local .codemie config', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '/workspace/project';
+      hasLocalConfigMock.mockResolvedValue(false);
+      await run();
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/workspace/project');
+    });
+
+    it('returns the pinned project for a session without re-resolving from cwd', async () => {
+      readPinnedProjectNameMock.mockResolvedValue('pinned-project');
+      await run({ sessionId: 's1' });
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'pinned-project' });
+      expect(getActiveProfileNameMock).not.toHaveBeenCalled();
+    });
+
+    it("pins a session's first resolved project for its later hooks to read back unchanged", async () => {
+      await run({ sessionId: 's1' });
+      expect(pinProjectNameMock).toHaveBeenCalledWith('s1', 'proj-1');
+    });
+
+    it('CODEMIE_PROJECT wins over a pinned project, and is never itself pinned', async () => {
+      process.env['CODEMIE_PROJECT'] = 'env-project';
+      await run({ sessionId: 's1' });
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'env-project' });
+      expect(readPinnedProjectNameMock).not.toHaveBeenCalled();
+      expect(pinProjectNameMock).not.toHaveBeenCalled();
+    });
+
+    it('does not consult or write the pin for a hook with no sessionId', async () => {
+      await run();
+      expect(readPinnedProjectNameMock).not.toHaveBeenCalled();
+      expect(pinProjectNameMock).not.toHaveBeenCalled();
+    });
+
+    it("uses this hook's own resolved value when it loses the pin race", async () => {
+      pinProjectNameMock.mockResolvedValue('winner-project');
+      await run({ sessionId: 's1' });
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'winner-project' });
+    });
+
+    it('still forwards with empty identity fields when identity resolution fails, independent of project and version', async () => {
       resolveHookCredentialsMock.mockRejectedValue(new Error('boom'));
       await run();
       expect(forwarded()).toHaveLength(1);
@@ -230,8 +347,8 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
         user_email: '',
         developer_name: '',
         identity_source: '',
-        codemie_project_name: '',
-        codemie_cli_version: '',
+        codemie_project_name: 'proj-1',
+        codemie_cli_version: '1.2.3',
         git_branch: 'main',
       });
     });
@@ -245,12 +362,72 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
   });
 
   describe('built event', () => {
-    it('stamps schema_version, a unique event_id, session_id and the hook cwd', async () => {
-      await run({ payload: [{ session_id: 's1' }, { session_id: 's1' }] });
+    it('stamps schema_version, a deterministic event_id, session_id and the repository identifier as cwd', async () => {
+      await run({ payload: [{ session_id: 's1', n: 1 }, { session_id: 's1', n: 2 }] });
       const [first, second] = forwarded();
-      expect(first).toMatchObject({ schema_version: 2, session_id: 's1', cwd: '/repo' });
-      expect(typeof first['event_id']).toBe('string');
+      expect(first).toMatchObject({ schema_version: 2, session_id: 's1', cwd: 'repo' });
+      // `<type>:<session_id>:<sha256 of the record's canonical payload + timestamp>`.
+      expect(String(first['event_id'])).toMatch(/^fake\.event:s1:[0-9a-f]{64}$/);
       expect(first['event_id']).not.toBe(second['event_id']);
+    });
+
+    it('re-derives the same event_id for identical content at the same timestamp', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-06T07:08:09.000Z'));
+      try {
+        await run({ payload: [{ session_id: 's1', n: 1 }] });
+        await run({ payload: [{ session_id: 's1', n: 1 }] });
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(forwarded()[1]['event_id']).toBe(forwarded()[0]['event_id']);
+    });
+
+    it('changes the id when the hook time changes', async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-05-06T07:08:09.000Z'));
+        await run({ payload: [{ session_id: 's1', n: 1 }] });
+        vi.setSystemTime(new Date('2026-05-06T07:09:09.000Z'));
+        await run({ payload: [{ session_id: 's1', n: 1 }] });
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(forwarded()[1]['event_id']).not.toBe(forwarded()[0]['event_id']);
+    });
+
+    describe('cwd is the repository identifier, never an absolute path', () => {
+      it.each([
+        ['/Users/lika/Projects/qa-projects/pr609-preview-agents', 'qa-projects/pr609-preview-agents'],
+        ['C:\\Projects\\qa-projects\\pr609-preview-agents', 'qa-projects/pr609-preview-agents'],
+        [
+          '/Users/alice/Library/Application Support/Claude-3p/local-agent-mode-sessions/abc/def/local_7fb4c6a0-a7b9-4121-960c-035d0e4830ff/outputs',
+          'Cowork',
+        ],
+        ['/', 'unknown'],
+      ])('stamps %s as %s on the event and raw', async (cwd, expected) => {
+        await run({ cwd });
+        const event = forwarded()[0];
+        expect(event['cwd']).toBe(expected);
+        expect((event['raw'] as Record<string, unknown>)['cwd']).toBe(expected);
+        expect(String(event['cwd'])).not.toMatch(/^([/\\]|[A-Za-z]:)/);
+      });
+
+      it('keeps repo_remote empty when the remote is unknown', async () => {
+        detectGitRemoteRepoMock.mockResolvedValue(undefined);
+        await run({ cwd: '/Users/lika/Projects/qa-projects/pr609-preview-agents' });
+        expect(forwarded()[0]).toMatchObject({ repo_remote: '', cwd: 'qa-projects/pr609-preview-agents' });
+      });
+
+      it('leaves a detected repo_remote unchanged', async () => {
+        await run({ cwd: '/Users/lika/Projects/qa-projects/pr609-preview-agents' });
+        expect(forwarded()[0]).toMatchObject({ repo_remote: 'org/repo', cwd: 'qa-projects/pr609-preview-agents' });
+      });
+
+      it('lets an event-supplied repo_remote override while cwd stays short', async () => {
+        await run({ cwd: '/Users/lika/Projects/qa-projects/pr609-preview-agents', payload: [{ repo_remote: 'evt/remote' }] });
+        expect(forwarded()[0]).toMatchObject({ repo_remote: 'evt/remote', cwd: 'qa-projects/pr609-preview-agents' });
+      });
     });
 
     it('coerces a missing session_id to an empty string', async () => {
@@ -260,7 +437,7 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
 
     it('puts the hook cwd on derived events too, not the event\'s own', async () => {
       await run({ payload: [{ type: 'derived.event', session_id: 's1' }] });
-      expect(forwarded()[0]['cwd']).toBe('/repo');
+      expect(forwarded()[0]['cwd']).toBe('repo');
     });
 
     it('resolves the type from resolveEventType and keeps an explicit one', async () => {
@@ -284,6 +461,21 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
       expect(String(record['tool_input']).startsWith('{"text":"x')).toBe(true);
       expect(record['tool_response']).toHaveLength(300);
       expect(record['error']).toHaveLength(300);
+    });
+
+    it('normalizes effort objects to their level and omits malformed values', async () => {
+      await run({
+        payload: [
+          { effort: { level: 'high' } },
+          { effort: { unsupported: true } },
+        ],
+      });
+
+      const [valid, malformed] = forwarded();
+      expect(valid['effort']).toBe('high');
+      expect((valid['raw'] as Record<string, unknown>)['effort']).toBe('high');
+      expect(malformed).not.toHaveProperty('effort');
+      expect(malformed).not.toHaveProperty('raw.effort');
     });
 
     it('does not add truncated fields to events that lack them, and prompt_body is empty', async () => {

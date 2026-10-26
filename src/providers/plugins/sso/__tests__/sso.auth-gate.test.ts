@@ -69,6 +69,48 @@ describe('ensureCodeMieSsoAuth', () => {
     expect(result.loginOutcome).toBe('started');
   });
 
+  it('ignores a marker written for a different profile (PR #655 review: marker not keyed by environment)', async () => {
+    // The marker's own baseUrl (PROD) matches neither this profile's syncApiUrl nor its ssoUrl
+    // (PREVIEW) — a redirect in PROD's proxy must not block or re-login a healthy PREVIEW session.
+    getStoredCredentials.mockResolvedValue({ cookies: { a: 'b' } });
+    vi.mocked(getAnalyticsAuthStatus).mockResolvedValue({ reason: 'HTTP 401', baseUrl: PROD } as never);
+
+    const result = await ensureCodeMieSsoAuth({ provider: 'ai-run-sso', ssoUrl: PREVIEW, syncApiUrl: PREVIEW });
+
+    expect(result).toEqual({ ok: true });
+    expect(startDetachedSsoLogin).not.toHaveBeenCalled();
+  });
+
+  it('matches a marker whose targetApiUrl host differs from CODEMIE_URL, via the input.baseUrl candidate (PR #661 review)', async () => {
+    // The marker is keyed to the LLM-request proxy's own target URL, which can be on a
+    // different host than CODEMIE_URL/CODEMIE_SYNC_API_URL (e.g. a dedicated LLM gateway).
+    // hook.ts now passes the preserved CODEMIE_TARGET_API_URL as input.baseUrl for exactly this
+    // case — the gate must still match and block even though ssoUrl/syncApiUrl's host differs.
+    const TARGET_API_URL = 'https://llm-gateway.example.com';
+    getStoredCredentials.mockResolvedValue({ cookies: { a: 'b' } });
+    vi.mocked(getAnalyticsAuthStatus).mockResolvedValue({ reason: 'HTTP 401', baseUrl: TARGET_API_URL } as never);
+
+    const result = await ensureCodeMieSsoAuth({
+      provider: 'ai-run-sso',
+      ssoUrl: 'https://codemie.example.com',
+      syncApiUrl: 'https://codemie.example.com',
+      baseUrl: TARGET_API_URL,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('rejected the stored credentials');
+  });
+
+  it('still applies a marker with no baseUrl of its own (old format, never crashes)', async () => {
+    getStoredCredentials.mockResolvedValue({ cookies: { a: 'b' } });
+    vi.mocked(getAnalyticsAuthStatus).mockResolvedValue({ reason: 'HTTP 401' } as never); // no baseUrl field at all
+
+    const result = await ensureCodeMieSsoAuth(configured);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('rejected the stored credentials');
+  });
+
   it('blocks without starting a sign-in when the provider is SSO but no url is configured', async () => {
     const result = await ensureCodeMieSsoAuth({ provider: 'ai-run-sso' });
 

@@ -1,45 +1,27 @@
-import { randomUUID } from 'node:crypto';
 import { logger } from '@/utils/logger.js';
-import { detectGitBranch, detectGitRemoteRepo } from '@/utils/processes.js';
-import { ConfigLoader } from '@/utils/config.js';
-import { getCurrentCliVersion } from '@/utils/cli-updater.js';
+import { extractRepository } from '@/utils/paths.js';
 import { AgentAdapterType, type OtlpAdapterDeps } from './types.js';
-import { resolveStoryFor } from './story-resolver.js';
-import { resolveHookCredentials } from './hook-credentials.js';
-import { resolveEmailFromCredentials, resolveIdentity } from './identity-resolver.js';
+import { resolveRepoFields, type RepoFields } from './event-fields/repo-fields.js';
+import { resolveIdentityFields, type IdentityFields } from './event-fields/identity-fields.js';
+import { resolveBranchStory } from './story-resolver.js';
 
 export type ForwardDecision<TBlockOutput = Record<string, unknown>> =
   | {
-      decision: 'forward';
-      payload: Record<string, unknown>[];
-      /** SessionEnd only: resend the same built events once if the first attempt failed. */
-      retryOnce?: boolean;
-      /** Called exactly once, after the send attempt. Commits state only when accepted; always releases any lock the handler is holding. */
-      finalize?: (accepted: boolean) => Promise<void>;
-    }
+    decision: 'forward';
+    payload: Record<string, unknown>[];
+    /** SessionEnd only: resend the same built events once if the first attempt failed. */
+    retryOnce?: boolean;
+    /** Called exactly once, after the send attempt. Commits state only when accepted; always releases any lock the handler is holding. */
+    finalize?: (accepted: boolean) => Promise<void>;
+  }
   | { decision: 'block'; reason: string; hookSpecificOutput: TBlockOutput };
 
 export interface OtlpHookContext {
   cwd: string;
   /** Only for prompt-submit style events; enables the marker/mention story tiers. */
   prompt?: string;
-}
-
-/** Git and story fields, resolved from the hook's cwd and prompt. */
-interface RepoFields {
-  git_branch: string;
-  repo_remote: string;
-  story_id: string;
-  story_source: string;
-}
-
-/** Identity, project and version fields, resolved from the hook's cwd and the stored SSO credentials. */
-interface IdentityFields {
-  user_email: string;
-  developer_name: string;
-  identity_source: string;
-  codemie_project_name: string;
-  codemie_cli_version: string;
+  /** Pins the resolved project per session (see `resolveProjectName`); omitted adapters get the unpinned, per-hook-cwd behavior. */
+  sessionId?: string;
 }
 
 /** Agent-independent fields resolved by the base class at hook time. */
@@ -59,7 +41,7 @@ interface InvocationContext {
 
 const SCHEMA_VERSION = 2;
 const MAX_PROMPT_CHARS = 200;
-const MAX_TOOL_FIELD_CHARS = 300;
+export const MAX_TOOL_FIELD_CHARS = 300;
 
 /**
  * Base class for adapters that ingest a coding tool's native hook events into the
@@ -151,6 +133,7 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
   protected abstract resolveAgentFields(): Promise<Record<string, unknown>>;
   /** `type` of a native event that does not carry an explicit one. */
   protected abstract resolveEventType(event: Record<string, unknown>): string;
+  protected abstract buildEventId(event: Record<string, unknown>, payload: Record<string, unknown>, timestamp: string): string;
 
   /**
    * Assembles the final event. `raw` mirrors the full enriched event, so the top
@@ -166,21 +149,30 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
       type: typeof explicitType === 'string' && explicitType.length > 0 ? explicitType : this.resolveEventType(hookEvent),
       session_id: String(hookEvent['session_id'] ?? ''),
       timestamp: this.resolveEventTimestamp(hookEvent['timestamp'], ctx.hookTime),
-      cwd: ctx.cwd,
+      cwd: extractRepository(ctx.cwd),
       prompt_body: this.boundedText(hookEvent['prompt'], MAX_PROMPT_CHARS),
       schema_version: SCHEMA_VERSION,
-      event_id: randomUUID(),
     };
+    event['event_id'] = this.buildEventId(event, limited, String(event['timestamp']));
     return { ...event, raw: { ...event } };
   }
 
   /** Truncates the free-text fields; a nested `raw` is dropped so it cannot bypass the limits. */
   private limitPayload(hookEvent: Record<string, unknown>): Record<string, unknown> {
     const limited: Record<string, unknown> = { ...hookEvent };
+    const effort = limited['effort'];
+    if (typeof effort === 'object' && effort !== null && !Array.isArray(effort)) {
+      const level: unknown = Reflect.get(effort, 'level');
+      if (typeof level === 'string') {
+        limited['effort'] = level;
+      } else {
+        delete limited['effort'];
+      }
+    }
     if (Object.prototype.hasOwnProperty.call(hookEvent, 'prompt')) {
       limited['prompt'] = this.boundedText(hookEvent['prompt'], MAX_PROMPT_CHARS);
     }
-    for (const field of ['tool_input', 'tool_response', 'error']) {
+    for (const field of ['tool_input', 'tool_response', 'error', 'description']) {
       if (Object.prototype.hasOwnProperty.call(hookEvent, field)) {
         limited[field] = this.boundedText(hookEvent[field], MAX_TOOL_FIELD_CHARS);
       }
@@ -220,74 +212,12 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
     return hookTime.toISOString();
   }
 
-  /**
-   * Identity, project and CLI version for the hook's cwd. Credentials are the SSO ones the
-   * daemon will use (see `resolveHookCredentials`); without them identity falls through to
-   * the git, codemie_cli and os tiers. A failed lookup yields empty fields, never a dropped event.
-   */
-  private async resolveIdentityFields(cwd: string): Promise<IdentityFields> {
-    const empty: IdentityFields = {
-      user_email: '',
-      developer_name: '',
-      identity_source: '',
-      codemie_project_name: '',
-      codemie_cli_version: '',
-    };
-    try {
-      const credentials = await resolveHookCredentials();
-      const [identity, projectName, version] = await Promise.all([
-        resolveIdentity(credentials, cwd),
-        this.resolveProjectName(cwd),
-        getCurrentCliVersion(),
-      ]);
-      return {
-        user_email: resolveEmailFromCredentials(credentials),
-        developer_name: identity.developerName,
-        identity_source: identity.identitySource,
-        codemie_project_name: projectName,
-        codemie_cli_version: version ?? '',
-      };
-    } catch (error) {
-      logger.debug(`[${this.name}] identity field resolution failed: ${error instanceof Error ? error.message : String(error)}`);
-      return empty;
-    }
-  }
-
-  private async resolveProjectName(cwd: string): Promise<string> {
-    try {
-      const profileName = await ConfigLoader.getActiveProfileName(cwd);
-      const config = await ConfigLoader.load(cwd, profileName ? { name: profileName } : undefined);
-      return config.codeMieProject ?? '';
-    } catch {
-      return '';
-    }
-  }
-
   private async resolveCommonFields(context: OtlpHookContext): Promise<CommonFields> {
     const [repoFields, identityFields] = await Promise.all([
-      this.resolveRepoFields(context),
-      this.resolveIdentityFields(context.cwd),
+      resolveRepoFields(context),
+      resolveIdentityFields(context),
     ]);
     return { ...repoFields, ...identityFields };
-  }
-
-  private async resolveRepoFields({ cwd, prompt }: OtlpHookContext): Promise<RepoFields> {
-    const empty: RepoFields = { git_branch: '', repo_remote: '', story_id: '', story_source: '' };
-    try {
-      const [branch, remote] = cwd
-        ? await Promise.all([detectGitBranch(cwd), detectGitRemoteRepo(cwd)])
-        : [undefined, undefined];
-      const story = await resolveStoryFor({ cwd, branch, prompt });
-      return {
-        git_branch: branch ?? '',
-        repo_remote: remote ?? '',
-        story_id: story?.storyId ?? '',
-        story_source: story?.storySource ?? '',
-      };
-    } catch (error) {
-      logger.debug(`[${this.name}] repo field resolution failed: ${error instanceof Error ? error.message : String(error)}`);
-      return empty;
-    }
   }
 
   /** Stamps the common fields; for the overridable ones a hook event's own non-empty string value wins. */
@@ -299,6 +229,25 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
         merged[key] = own;
       }
     }
+
+    // An event can carry its own git_branch (e.g. agent.usage.request's transcript-line branch),
+    // which lags the hook-time branch whenever the branch changes mid-turn — a hook fires once
+    // per turn, on the branch current *at that time*, but an event inside the same payload can
+    // describe something that happened earlier, on a different branch. The
+    // explicit/marker/mention story tiers are not branch-scoped, so only the branch tier (or "no
+    // story resolved") is worth re-deriving here, and only for the event's own branch.
+    const ownBranch = merged['git_branch'];
+    if (
+      (commonFields.story_source === 'branch' || commonFields.story_source === '') &&
+      typeof ownBranch === 'string' &&
+      ownBranch.length > 0 &&
+      ownBranch !== commonFields.git_branch
+    ) {
+      const rebased = resolveBranchStory(ownBranch);
+      merged['story_id'] = rebased?.storyId ?? '';
+      merged['story_source'] = rebased?.storySource ?? '';
+    }
+
     return merged;
   }
 }
